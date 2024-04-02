@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Election - {{ elected_role }}{% endblock %}
+{% block content %}
+<h1>Election - {{ elected_role }}</h1>
+
+<h2>Phase 1 - Nominees</h2>
+
+{% if phase == ElectionPhase::Creation %}
+<form action="/election/{{ elected_role }}/nominate" method="post">
+    <label for="name">Name:</label>
+    <input type="text" id="name" name="name" required>
+    <input type="submit" value="Nominate">
+</form>
+
+<div>
+    {% for candidate in nominees %}
+      <div>
+          {{ candidate }}
+      </div>
+    {% endfor %}
+</div>
+{% endif %}
+{% endblock %}
