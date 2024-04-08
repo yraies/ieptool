@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{sse::Event, IntoResponse, Sse},
     routing::{get, post},
@@ -60,6 +60,7 @@ async fn main() {
     let router = Router::new()
         .route("/", get(view_home))
         .route("/election", post(post_election))
+        .route("/election/join", get(get_election_join))
         .route("/election/:id/voting", get(view_election_voting))
         .route("/election/:id/voting", post(post_election_voting))
         .route("/election/:id/voting/form", get(get_election_voting_form))
@@ -88,6 +89,7 @@ enum ElectionPhase {
     FirstTally,
     SecondVote,
     SecondTally,
+    SafetyRound,
 }
 
 impl ElectionPhase {
@@ -96,7 +98,8 @@ impl ElectionPhase {
             ElectionPhase::FirstVote => "tally1",
             ElectionPhase::FirstTally => "vote2",
             ElectionPhase::SecondVote => "tally2",
-            ElectionPhase::SecondTally => "none",
+            ElectionPhase::SecondTally => "safety",
+            ElectionPhase::SafetyRound => "none",
         }
     }
 
@@ -106,6 +109,7 @@ impl ElectionPhase {
             ElectionPhase::FirstTally => "Results of First Vote",
             ElectionPhase::SecondVote => "Second Vote",
             ElectionPhase::SecondTally => "Results of Second Vote",
+            ElectionPhase::SafetyRound => "Safety Round",
         }
     }
 
@@ -120,6 +124,9 @@ impl ElectionPhase {
             }
             ElectionPhase::SecondVote => html!(p {"Please vote for your preferred candidate."}),
             ElectionPhase::SecondTally => html!(p {"The results of the second vote are in!"}),
+            ElectionPhase::SafetyRound => html!(
+                p {"Is this decision safe enough to try?"}
+            ),
         }
     }
 }
@@ -210,7 +217,8 @@ async fn post_election_step(
             ElectionPhase::FirstVote => ElectionPhase::FirstTally,
             ElectionPhase::FirstTally => ElectionPhase::SecondVote,
             ElectionPhase::SecondVote => ElectionPhase::SecondTally,
-            ElectionPhase::SecondTally => ElectionPhase::SecondTally,
+            ElectionPhase::SecondTally => ElectionPhase::SafetyRound,
+            ElectionPhase::SafetyRound => ElectionPhase::SafetyRound,
         };
         stream
             .send(ElectionUpdate::PhaseChanged)
@@ -262,6 +270,23 @@ async fn post_election_voting(
     })
 }
 
+async fn get_election_join(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let id = params.get("election_id");
+    match id {
+        Some(id) => (
+            StatusCode::OK,
+            [(
+                "HX-Redirect".to_string(),
+                format!("/election/{}/voting", id),
+            )],
+        ),
+        None => (
+            StatusCode::BAD_REQUEST,
+            [("HX-Redirect".to_string(), "/".to_string())],
+        ),
+    }
+}
+
 async fn get_election_eval_content(
     Path(id): Path<String>,
     State(state): State<ElectionDB>,
@@ -303,6 +328,34 @@ async fn view_election_eval(
 }
 
 fn eval_election(election: &ElectionProcess) -> Markup {
+    if election.phase == ElectionPhase::SafetyRound {
+        let accumulated_votes = election
+            .second_round_id
+            .iter()
+            .into_group_map_by(|(_, &v)| v)
+            .iter()
+            .map(|(k, v)| (election.nominees.get(k).unwrap(), v.len()))
+            .filter(|(_k, v)| *v > 0)
+            .sorted_by(|a, b| Ord::cmp(&a.1, &b.1).then_with(|| Ord::cmp(&a.0, &b.0).reverse()))
+            .rev()
+            .collect::<Vec<_>>();
+        let max_votes = accumulated_votes
+            .iter()
+            .map(|(_k, v)| *v)
+            .max()
+            .unwrap_or(1);
+        let all_with_max_votes = accumulated_votes
+            .iter()
+            .filter(|(_k, v)| *v == max_votes)
+            .map(|(k, _v)| k.to_string())
+            .collect::<Vec<_>>();
+        return html! {
+            h2 { (election.phase.nice_title()) }
+            p { (election.phase.nice_description()) }
+            p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
+        };
+    }
+
     let tally = eval_tally(election);
 
     let eval_count = {
@@ -313,6 +366,7 @@ fn eval_election(election: &ElectionProcess) -> Markup {
             ElectionPhase::SecondVote | ElectionPhase::SecondTally => {
                 html! { p { "Number of votes: " (election.second_round_id.len()) } }
             }
+            ElectionPhase::SafetyRound => unreachable!(),
         }
     };
 
@@ -323,7 +377,7 @@ fn eval_election(election: &ElectionProcess) -> Markup {
 
         {( tally )}
 
-        @if election.phase != ElectionPhase::SecondTally {
+        @if election.phase != ElectionPhase::SafetyRound {
             button
               hx-post={"/election/" (election.id.to_string()) "/next-step/" (election.phase.next_url())}
               hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?"
@@ -336,10 +390,9 @@ fn eval_election(election: &ElectionProcess) -> Markup {
 
 fn eval_tally(election: &ElectionProcess) -> Markup {
     let round = match election.phase {
-        ElectionPhase::FirstVote => &election.first_round_id,
         ElectionPhase::FirstTally => &election.first_round_id,
-        ElectionPhase::SecondVote => &election.second_round_id,
         ElectionPhase::SecondTally => &election.second_round_id,
+        _ => return html! { p { "The current phase does not have a tally." } },
     };
 
     if !(election.phase == ElectionPhase::FirstTally
@@ -434,7 +487,7 @@ async fn view_election_voting(
               }
             }
         },
-        html!(strong { a href={"/election/" (id) "/eval"} ."secondary" {(id)} }),
+        html!(strong { a href={"/election/" (id) "/voting"} ."secondary" {(id)} }),
     ))
 }
 
@@ -451,37 +504,67 @@ async fn get_election_voting_form(
 }
 
 fn voting_form(election: &ElectionProcess) -> Markup {
-    if election.phase != ElectionPhase::FirstVote && election.phase != ElectionPhase::SecondVote {
-        html! {
-            h2 { (election.phase.nice_title()) }
-            p { (election.phase.nice_description()) }
-            {( eval_tally(election) )}
-        }
-    } else {
-        let sorted_nominees = election.nominees.iter().sorted_by_key(|(k, _)| *k);
-        html! {
-            h2 { (election.phase.nice_title()) }
-            p { (election.phase.nice_description()) }
-            form #"vote" ."table rows" {
-                label for="elected_role" {
-                    "Voter Name: ";
-                    input type="text" name="voter_name" required {}
-                }
-                label for="vote" {
-                    "Vote :";
-                    select name="vote" required {
-                        @for (id, nominee) in sorted_nominees {
-                            option value=(id.to_string()) { (nominee) }
+    match election.phase {
+        ElectionPhase::FirstVote | ElectionPhase::SecondVote => {
+            let sorted_nominees = election.nominees.iter().sorted_by_key(|(k, _)| *k);
+            html! {
+                h2 { (election.phase.nice_title()) }
+                p { (election.phase.nice_description()) }
+                form #"vote" ."table rows" {
+                    label for="elected_role" {
+                        "Voter Name: ";
+                        input type="text" name="voter_name" required {}
+                    }
+                    label for="vote" {
+                        "Vote :";
+                        select name="vote" required {
+                            @for (id, nominee) in sorted_nominees {
+                                option value=(id.to_string()) { (nominee) }
+                            }
                         }
                     }
-                }
-                button
-                  hx-post={"/election/" (election.id.to_string()) "/voting"}
-                  hx-trigger="click" hx-target="#vote" hx-swap="outerHTML"
-                  style="left: 50%; position: relative; translate: -50%;" {
-                    "Vote!"
+                    button
+                      hx-post={"/election/" (election.id.to_string()) "/voting"}
+                      hx-trigger="click" hx-target="#vote" hx-swap="outerHTML"
+                      style="left: 50%; position: relative; translate: -50%;" {
+                        "Vote!"
+                    }
                 }
             }
+        }
+        ElectionPhase::FirstTally | ElectionPhase::SecondTally => {
+            html! {
+                h2 { (election.phase.nice_title()) }
+                p { (election.phase.nice_description()) }
+                {( eval_tally(election) )}
+            }
+        }
+        ElectionPhase::SafetyRound => {
+            let accumulated_votes = election
+                .second_round_id
+                .iter()
+                .into_group_map_by(|(_, &v)| v)
+                .iter()
+                .map(|(k, v)| (election.nominees.get(k).unwrap(), v.len()))
+                .filter(|(_k, v)| *v > 0)
+                .sorted_by(|a, b| Ord::cmp(&a.1, &b.1).then_with(|| Ord::cmp(&a.0, &b.0).reverse()))
+                .rev()
+                .collect::<Vec<_>>();
+            let max_votes = accumulated_votes
+                .iter()
+                .map(|(_k, v)| *v)
+                .max()
+                .unwrap_or(1);
+            let all_with_max_votes = accumulated_votes
+                .iter()
+                .filter(|(_k, v)| *v == max_votes)
+                .map(|(k, _v)| k.to_string())
+                .collect::<Vec<_>>();
+            html!(
+                h2 { (election.phase.nice_title()) }
+                p { (election.phase.nice_description()) }
+                p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
+            )
         }
     }
 }
@@ -492,6 +575,26 @@ async fn view_home() -> Markup {
         html!("IEP Tool Home"),
         html! {
             p { "Welcome to the Integrative Election Process Tool! Press the button below to start a new election." }
+
+            h2 { "Join Election" }
+            form #"join-election" ."table rows" {
+                label for="election_id" {
+                    "Election ID: ";
+                    input type="text" name="election_id" required {}
+                }
+                button
+                  hx-get={"/election/join"}
+                  hx-trigger="click" hx-swap="outerHTML"
+                  hx-include="[name='election_id']"
+                  style="left: 50%; position: relative; translate: -50%;" {
+                    "Join Election"
+                }
+            }
+
+
+            br;
+            h2 { "New Election" }
+
             form #"new-election" ."table rows" {
                 label for="elected_role" {
                     "Elected Role: ";
