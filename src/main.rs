@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -66,7 +67,7 @@ async fn main() {
         .route("/election/:id/voting/form", get(get_election_voting_form))
         .route("/election/:id/eval", get(view_election_eval))
         .route("/election/:id/eval/content", get(get_election_eval_content))
-        .route("/election/:id/next-step/:step", post(post_election_step))
+        .route("/election/:id/step/:type/:step", post(post_election_step))
         .route("/election/:id/stream", get(get_election_sse_stream))
         .with_state(ElectionDB {
             db: Arc::new(Mutex::new(state)),
@@ -83,7 +84,16 @@ async fn main() {
         .unwrap();
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Copy, Clone)]
+#[derive(
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Debug,
+    Copy,
+    Clone,
+    strum_macros::EnumString,
+    strum_macros::Display,
+)]
 enum ElectionPhase {
     FirstVote,
     FirstTally,
@@ -93,16 +103,6 @@ enum ElectionPhase {
 }
 
 impl ElectionPhase {
-    fn next_url(&self) -> &'static str {
-        match self {
-            ElectionPhase::FirstVote => "tally1",
-            ElectionPhase::FirstTally => "vote2",
-            ElectionPhase::SecondVote => "tally2",
-            ElectionPhase::SecondTally => "safety",
-            ElectionPhase::SafetyRound => "none",
-        }
-    }
-
     fn nice_title(&self) -> &'static str {
         match self {
             ElectionPhase::FirstVote => "First Vote",
@@ -194,7 +194,7 @@ async fn post_election(
 }
 
 async fn post_election_step(
-    Path((id, step)): Path<(String, String)>,
+    Path((id, step_type, step)): Path<(String, String, String)>,
     State(state): State<ElectionDB>,
 ) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
     let mut db = state
@@ -212,14 +212,47 @@ async fn post_election_step(
         .ok_or((StatusCode::NOT_FOUND, "Stream not found"))?
         .clone();
 
-    if election.phase.next_url().eq(&step[..]) {
-        election.phase = match election.phase {
-            ElectionPhase::FirstVote => ElectionPhase::FirstTally,
-            ElectionPhase::FirstTally => ElectionPhase::SecondVote,
-            ElectionPhase::SecondVote => ElectionPhase::SecondTally,
-            ElectionPhase::SecondTally => ElectionPhase::SafetyRound,
-            ElectionPhase::SafetyRound => ElectionPhase::SafetyRound,
-        };
+    if election
+        .phase
+        .eq(&ElectionPhase::from_str(&step).map_err(|_e| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Phase does not match current phase",
+            )
+        })?)
+    {
+        match &step_type[..] {
+            "next" => {
+                election.phase = match election.phase {
+                    ElectionPhase::FirstVote => ElectionPhase::FirstTally,
+                    ElectionPhase::FirstTally => ElectionPhase::SecondVote,
+                    ElectionPhase::SecondVote => ElectionPhase::SecondTally,
+                    ElectionPhase::SecondTally => ElectionPhase::SafetyRound,
+                    ElectionPhase::SafetyRound => ElectionPhase::SafetyRound,
+                };
+                Ok(())
+            }
+            "prev" => {
+                election.phase = match election.phase {
+                    ElectionPhase::FirstVote => ElectionPhase::FirstVote,
+                    ElectionPhase::FirstTally => ElectionPhase::FirstVote,
+                    ElectionPhase::SecondVote => ElectionPhase::FirstTally,
+                    ElectionPhase::SecondTally => ElectionPhase::SecondVote,
+                    ElectionPhase::SafetyRound => ElectionPhase::SecondTally,
+                };
+                Ok(())
+            }
+            "reset" => {
+                if election.phase == ElectionPhase::FirstVote {
+                    election.first_round_id.clear();
+                } else if election.phase == ElectionPhase::SecondVote {
+                    election.second_round_id.clear();
+                }
+                Ok(())
+            }
+            _ => Err((StatusCode::BAD_REQUEST, "Invalid step type")),
+        }?;
+
         stream
             .send(ElectionUpdate::PhaseChanged)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream send error"))?;
@@ -328,6 +361,34 @@ async fn view_election_eval(
 }
 
 fn eval_election(election: &ElectionProcess) -> Markup {
+    let buttons = html! {
+        div style="display: flex; justify-content: space-around;" {
+            @if election.phase != ElectionPhase::FirstVote {
+                button
+                hx-post={"/election/" (election.id.to_string()) "/step/prev/" (election.phase.to_string())}
+                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                    "Previous Phase"
+                }
+            }
+
+            @if election.phase == ElectionPhase::FirstVote || election.phase == ElectionPhase::SecondVote {
+                button ."outline secondary"
+                hx-post={"/election/" (election.id.to_string()) "/step/reset/" (election.phase.to_string())}
+                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                    "Reset Votes"
+                }
+            }
+
+            @if election.phase != ElectionPhase::SafetyRound {
+                button
+                hx-post={"/election/" (election.id.to_string()) "/step/next/" (election.phase.to_string())}
+                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                    "Next Phase"
+                }
+            }
+        }
+    };
+
     if election.phase == ElectionPhase::SafetyRound {
         let accumulated_votes = election
             .second_round_id
@@ -377,14 +438,7 @@ fn eval_election(election: &ElectionProcess) -> Markup {
 
         {( tally )}
 
-        @if election.phase != ElectionPhase::SafetyRound {
-            button
-              hx-post={"/election/" (election.id.to_string()) "/next-step/" (election.phase.next_url())}
-              hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?"
-              style="left: 50%; position: relative; translate: -50%;" {
-                "Next Phase"
-            }
-        }
+        {( buttons )}
     }
 }
 

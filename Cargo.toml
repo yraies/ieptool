@@ -18,3 +18,5 @@ itertools = "0.12.1"
 tower = "0.4.13"
 tracing = { version = "0.1.40", features = ["async-await"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+strum = { version = "0.26.2", features = ["derive"] }
+strum_macros = "0.26.2"
