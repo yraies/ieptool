@@ -7,6 +7,7 @@ use axum::{
 };
 use itertools::*;
 use maud::{html, Markup, DOCTYPE};
+use qrcode::{render::svg::Color, QrCode};
 use rand::distributions::DistString;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -72,6 +73,7 @@ async fn main() {
         .with_state(ElectionDB {
             db: Arc::new(Mutex::new(state)),
             streams: Arc::new(Mutex::new(streams)),
+            base_url: std::env::var("BASE_URL").unwrap_or("http://localhost:3000".to_string()),
         })
         .fallback_service(ServeDir::new("static"))
         .layer(TraceLayer::new_for_http());
@@ -145,6 +147,7 @@ struct ElectionProcess {
 struct ElectionDB {
     db: Arc<Mutex<HashMap<String, ElectionProcess>>>,
     streams: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ElectionUpdate>>>>,
+    base_url: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -161,12 +164,15 @@ async fn post_election(
         .db
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB Lock error"))?;
-    let id = rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 4);
+    let id = rand::distributions::Alphanumeric
+        .sample_string(&mut rand::thread_rng(), 5)
+        .to_ascii_lowercase();
     let nominees = form
         .nominees
         .lines()
         .filter(|n| !n.is_empty())
         .sorted()
+        .dedup()
         .enumerate()
         .map(|(i, n)| (i as u64, n.to_string()))
         .collect::<HashMap<_, _>>();
@@ -342,6 +348,15 @@ async fn view_election_eval(
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let election = db.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let voting_path = format!("/election/{}/voting", id);
+    let voting_url = format!("{}{}", &state.base_url, voting_path);
+    let qrcode_svg = QrCode::with_error_correction_level(voting_url.as_bytes(), qrcode::EcLevel::H)
+        .unwrap()
+        .render::<Color>()
+        .quiet_zone(true)
+        .dark_color(Color("var(--qr-bg)"))
+        .light_color(Color("var(--qr-fg)"))
+        .build();
 
     Ok(base_html(
         format!("{} - Evaluation", election.elected_role).as_str(),
@@ -356,35 +371,49 @@ async fn view_election_eval(
                 }
             }
         },
-        html!(strong {a href={"/election/" (id) "/voting"} ."secondary" {(id)}}),
+        html!(
+            dialog #"share-dialog" style="text-align: center;" {
+                article {
+                    header {
+                        h2 { "Share the election of " (election.elected_role) }
+                    }
+                    (maud::PreEscaped(qrcode_svg))
+                    br; br;
+                    a ."contrast" href=(voting_path) { (voting_url) }
+                    footer {
+                        button style="margin-right:unset;"
+                            onclick="document.getElementById('share-dialog').close()" { "Close" }
+                    }
+                }
+            }
+            button ."secondary" onclick="document.getElementById('share-dialog').show()"
+                style="transform: translate(0,0.2em)" {
+                (id) " 🔗"
+            }
+        ),
     ))
 }
 
 fn eval_election(election: &ElectionProcess) -> Markup {
     let buttons = html! {
-        div style="display: flex; justify-content: space-around;" {
-            @if election.phase != ElectionPhase::FirstVote {
-                button
-                hx-post={"/election/" (election.id.to_string()) "/step/prev/" (election.phase.to_string())}
-                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
-                    "Previous Phase"
-                }
+        div ."button-grid" {
+            button ."lbut" disabled[election.phase == ElectionPhase::FirstVote]
+            hx-post={"/election/" (election.id.to_string()) "/step/prev/" (election.phase.to_string())}
+            hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                "Previous Phase"
             }
 
-            @if election.phase == ElectionPhase::FirstVote || election.phase == ElectionPhase::SecondVote {
-                button ."outline secondary"
-                hx-post={"/election/" (election.id.to_string()) "/step/reset/" (election.phase.to_string())}
-                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
-                    "Reset Votes"
-                }
+            button ."cbut secondary"
+            disabled[election.phase != ElectionPhase::FirstVote && election.phase != ElectionPhase::SecondVote]
+            hx-post={"/election/" (election.id.to_string()) "/step/reset/" (election.phase.to_string())}
+            hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                "Reset Votes"
             }
 
-            @if election.phase != ElectionPhase::SafetyRound {
-                button
-                hx-post={"/election/" (election.id.to_string()) "/step/next/" (election.phase.to_string())}
-                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
-                    "Next Phase"
-                }
+            button ."rbut" disabled[election.phase == ElectionPhase::SafetyRound]
+            hx-post={"/election/" (election.id.to_string()) "/step/next/" (election.phase.to_string())}
+            hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                "Next Phase"
             }
         }
     };
@@ -444,15 +473,24 @@ fn eval_election(election: &ElectionProcess) -> Markup {
 
 fn eval_tally(election: &ElectionProcess) -> Markup {
     let round = match election.phase {
+        ElectionPhase::FirstVote => &election.first_round_id,
         ElectionPhase::FirstTally => &election.first_round_id,
+        ElectionPhase::SecondVote => &election.second_round_id,
         ElectionPhase::SecondTally => &election.second_round_id,
-        _ => return html! { p { "The current phase does not have a tally." } },
+        ElectionPhase::SafetyRound => &election.second_round_id,
     };
 
     if !(election.phase == ElectionPhase::FirstTally
         || election.phase == ElectionPhase::SecondTally)
     {
-        return html! {};
+        return html! {
+            p { "The following users have voted:" }
+            ul #"voter-list" {
+                @for voter_name in round.keys().sorted() {
+                    li { (voter_name) }
+                }
+            }
+        };
     }
 
     let accumulated_votes = round
@@ -691,13 +729,16 @@ fn base_html(title: &str, title_markup: Markup, content: Markup, fragment: Marku
             body {
                 header ."container" {
                     nav {
-                        ul { li { a href="/" ."secondary" {"🏠 IEP"} } }
+                        ul { li { a href="/" ."secondary" style="font-size: 1.5em;" {"🏠"} } }
                         ul { li style="font-size: 1.5em; text-align: center;"{ strong {(title_markup)} }}
                         ul { li {(fragment)} }
                     }
                 }
                 main ."container" {
                     div { (content) }
+                }
+                footer ."container" {
+                    p { "IEP Tool v" (env!("CARGO_PKG_VERSION"))}
                 }
             }
         }

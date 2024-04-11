@@ -1,3 +1,28 @@
+body {
+  padding: 0em 1em;
+}
+
+footer p {
+  font-size: 0.6em;
+  text-align: center;
+}
+
+
+
+#share-dialog svg {
+  --qr-bg: var(--pico-color);
+  --qr-fg: var(--pico-background-color);
+}
+
+@media only screen and (prefers-color-scheme: dark) {
+  #share-dialog svg {
+    --qr-bg: var(--pico-background-color);
+    --qr-fg: var(--pico-color);
+  }
+}
+
+
+
 #eval-chart .data {
 	color: black;
 	padding: 0em 0.3em 0.15em 0.3em;
@@ -9,4 +34,69 @@
 
 #eval-chart td {
   min-height: unset;
+}
+
+
+
+.button-grid {
+  display: grid;
+  gap: 1em 1em;
+  grid-auto-flow: row;
+  justify-content: space-around;
+  align-content: space-around;
+  justify-items: center;
+  align-items: center;
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: 1fr;
+  grid-template-areas: "lbut cbut rbut";
+  width: 100%;
+}
+
+@media only screen and (max-width: 600px) {
+  .button-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr 1fr 1fr;
+    grid-template-areas: "rbut" "cbut" "lbut";
+  }
+}
+
+.lbut { width: 10em; grid-area: lbut; }
+
+.cbut { grid-area: cbut; }
+
+.rbut { width: 10em; grid-area: rbut; }
+
+
+
+tr:hover {
+  background-color: var(--pico-mark-background-color);
+  color: var(--pico-mark-color);
+}
+
+tr:hover td {
+  background-color: var(--pico-mark-background-color);
+  color: var(--pico-mark-color);
+}
+
+
+
+#voter-list {
+  width: 100%;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  /*justify-content: space-evenly;*/
+  align-items: baseline;
+  align-content: space-around;
+}
+
+#voter-list > li {
+  list-style: none;
+  display: inline-block;
+  padding: 0.1em 0.6em 0.2em 0.6em;
+  background: var(--pico-muted-color);
+  color: var(--pico-background-color);
+  border: solid transparent 0;
+  border-radius: 1em;
 }

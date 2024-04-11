@@ -1,6 +1,6 @@
 [package]
 name = "ieptool"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -20,3 +20,4 @@ tracing = { version = "0.1.40", features = ["async-await"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 strum = { version = "0.26.2", features = ["derive"] }
 strum_macros = "0.26.2"
+qrcode = "0.14.0"
