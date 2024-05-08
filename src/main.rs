@@ -443,6 +443,8 @@ fn eval_election(election: &ElectionProcess) -> Markup {
             h2 { (election.phase.nice_title()) }
             p { (election.phase.nice_description()) }
             p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
+
+            {( buttons )}
         };
     }
 
