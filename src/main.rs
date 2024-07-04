@@ -7,6 +7,7 @@ use axum::{
 };
 use itertools::*;
 use maud::{html, Markup, DOCTYPE};
+use process::ElectionProcess;
 use qrcode::{render::svg::Color, QrCode};
 use rand::distributions::DistString;
 use serde::{Deserialize, Serialize};
@@ -17,10 +18,15 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::broadcast::Sender;
 use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 use tower::Layer;
 use tower_http::{normalize_path::NormalizePathLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::process::ElectionPhase;
+
+mod process;
 
 #[tokio::main]
 async fn main() {
@@ -29,7 +35,7 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 // axum logs rejections from built-in extractors with the `axum::rejection`
                 // target, at `TRACE` level. `axum::rejection=trace` enables showing those events
-                "example_tracing_aka_logging=info,tower_http=info,axum::rejection=trace".into()
+                "example_tracing_aka_logging=info,tower_http=debug,axum::rejection=trace".into()
             }),
         )
         .with(tracing_subscriber::fmt::layer())
@@ -46,14 +52,14 @@ async fn main() {
     test_vote_map.insert("Test Voter 3".to_string(), 13589);
     state.insert(
         "1337".to_string(),
-        ElectionProcess {
-            id: "1337".to_string(),
-            phase: ElectionPhase::FirstVote,
-            elected_role: "Test Role".to_string(),
-            nominees: test_nominee_map,
-            first_round_id: test_vote_map,
-            second_round_id: HashMap::new(),
-        },
+        process::ElectionProcess::new(
+            "1337".to_string(),
+            process::ElectionPhase::FirstVote,
+            "Test Role".to_string(),
+            test_nominee_map,
+            test_vote_map,
+            HashMap::new(),
+        ),
     );
 
     let mut streams = HashMap::new();
@@ -86,68 +92,58 @@ async fn main() {
         .unwrap();
 }
 
-#[derive(
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Debug,
-    Copy,
-    Clone,
-    strum_macros::EnumString,
-    strum_macros::Display,
-)]
-enum ElectionPhase {
-    FirstVote,
-    FirstTally,
-    SecondVote,
-    SecondTally,
-    SafetyRound,
-}
-
-impl ElectionPhase {
-    fn nice_title(&self) -> &'static str {
-        match self {
-            ElectionPhase::FirstVote => "First Vote",
-            ElectionPhase::FirstTally => "Results of First Vote",
-            ElectionPhase::SecondVote => "Second Vote",
-            ElectionPhase::SecondTally => "Results of Second Vote",
-            ElectionPhase::SafetyRound => "Safety Round",
-        }
-    }
-
-    fn nice_description(&self) -> Markup {
-        match self {
-            ElectionPhase::FirstVote => html!(p {"Please vote for your preferred candidate."}),
-            ElectionPhase::FirstTally => {
-                html!(
-                    p {"The results of the first vote are in!"}
-                    p {"Everyone can now explain their vote."}
-                )
-            }
-            ElectionPhase::SecondVote => html!(p {"Please vote for your preferred candidate."}),
-            ElectionPhase::SecondTally => html!(p {"The results of the second vote are in!"}),
-            ElectionPhase::SafetyRound => html!(
-                p {"Is this decision safe enough to try?"}
-            ),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
-struct ElectionProcess {
-    id: String,
-    phase: ElectionPhase,
-    elected_role: String,
-    nominees: HashMap<u64, String>,
-    first_round_id: HashMap<String, u64>,
-    second_round_id: HashMap<String, u64>,
-}
+type StatusError = (StatusCode, &'static str);
+const DB_UNLOCK_ERR: StatusError = (StatusCode::INTERNAL_SERVER_ERROR, "DB Lock error");
 
 #[derive(Clone)]
 struct ElectionDB {
     db: Arc<Mutex<HashMap<String, ElectionProcess>>>,
     streams: Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ElectionUpdate>>>>,
     base_url: String,
+}
+
+impl ElectionDB {
+    fn create_new_election(
+        &self,
+        elected_role: &str,
+        nominees: Vec<&str>,
+    ) -> Result<String, StatusError> {
+        let mut db = self.db.lock().map_err(|_| DB_UNLOCK_ERR)?;
+
+        let id = rand::distributions::Alphanumeric
+            .sample_string(&mut rand::thread_rng(), 5)
+            .to_ascii_lowercase();
+
+        let election = ElectionProcess::new_and_cleaned(id.clone(), elected_role, nominees);
+
+        db.insert(id.clone(), election);
+
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(id.clone(), tokio::sync::broadcast::channel(16).0);
+
+        Ok(id)
+    }
+
+    fn modify_election<F, T>(&self, id: &str, f: F) -> Result<T, StatusError>
+    where
+        F: FnOnce(&mut ElectionProcess, Sender<ElectionUpdate>) -> Result<T, StatusError>,
+    {
+        let mut db = self.db.lock().map_err(|_| DB_UNLOCK_ERR)?;
+        db.get_mut(id)
+            .ok_or((StatusCode::NOT_FOUND, "Election not found"))
+            .and_then(|election| {
+                let stream = self
+                    .streams
+                    .lock()
+                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream Lock error"))?
+                    .get(id)
+                    .ok_or((StatusCode::NOT_FOUND, "Stream not found"))?
+                    .clone();
+                f(election, stream)
+            })
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -159,113 +155,50 @@ struct ElectionCreation {
 async fn post_election(
     State(state): State<ElectionDB>,
     Form(form): Form<ElectionCreation>,
-) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
-    let mut db = state
-        .db
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB Lock error"))?;
-    let id = rand::distributions::Alphanumeric
-        .sample_string(&mut rand::thread_rng(), 5)
-        .to_ascii_lowercase();
-    let nominees = form
-        .nominees
-        .lines()
-        .filter(|n| !n.is_empty())
-        .sorted()
-        .dedup()
-        .enumerate()
-        .map(|(i, n)| (i as u64, n.to_string()))
-        .collect::<HashMap<_, _>>();
-    let election = ElectionProcess {
-        id: id.clone(),
-        phase: ElectionPhase::FirstVote,
-        elected_role: form.elected_role,
-        nominees,
-        first_round_id: HashMap::new(),
-        second_round_id: HashMap::new(),
-    };
-    db.insert(id.clone(), election);
+) -> Result<impl IntoResponse, StatusError> {
+    let election_id = state.create_new_election(
+        form.elected_role.as_str(),
+        form.nominees.lines().collect_vec(),
+    )?;
 
-    state
-        .streams
-        .lock()
-        .unwrap()
-        .insert(id.clone(), tokio::sync::broadcast::channel(16).0);
-
-    Ok((
+    let redirect_response = (
         StatusCode::CREATED,
-        [("HX-Redirect", format!("/election/{}/eval", id))],
-    )
-        .into_response())
+        [("HX-Redirect", format!("/election/{}/eval", election_id))],
+    );
+    Ok(redirect_response.into_response())
 }
 
 async fn post_election_step(
     Path((id, step_type, step)): Path<(String, String, String)>,
     State(state): State<ElectionDB>,
-) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
-    let mut db = state
-        .db
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB Lock error"))?;
-    let election = db
-        .get_mut(&id)
-        .ok_or((StatusCode::NOT_FOUND, "Election not found"))?;
-    let stream = state
-        .streams
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream Lock error"))?
-        .get(&id)
-        .ok_or((StatusCode::NOT_FOUND, "Stream not found"))?
-        .clone();
+) -> Result<impl IntoResponse, StatusError> {
+    state.modify_election(&id, |election, stream| {
+        let src_phase = &process::ElectionPhase::from_str(&step)
+            .map_err(|_e| (StatusCode::BAD_REQUEST, "Step unknown"))?;
 
-    if election
-        .phase
-        .eq(&ElectionPhase::from_str(&step).map_err(|_e| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Phase does not match current phase",
-            )
-        })?)
-    {
-        match &step_type[..] {
-            "next" => {
-                election.phase = match election.phase {
-                    ElectionPhase::FirstVote => ElectionPhase::FirstTally,
-                    ElectionPhase::FirstTally => ElectionPhase::SecondVote,
-                    ElectionPhase::SecondVote => ElectionPhase::SecondTally,
-                    ElectionPhase::SecondTally => ElectionPhase::SafetyRound,
-                    ElectionPhase::SafetyRound => ElectionPhase::SafetyRound,
-                };
-                Ok(())
-            }
-            "prev" => {
-                election.phase = match election.phase {
-                    ElectionPhase::FirstVote => ElectionPhase::FirstVote,
-                    ElectionPhase::FirstTally => ElectionPhase::FirstVote,
-                    ElectionPhase::SecondVote => ElectionPhase::FirstTally,
-                    ElectionPhase::SecondTally => ElectionPhase::SecondVote,
-                    ElectionPhase::SafetyRound => ElectionPhase::SecondTally,
-                };
-                Ok(())
-            }
-            "reset" => {
-                if election.phase == ElectionPhase::FirstVote {
-                    election.first_round_id.clear();
-                } else if election.phase == ElectionPhase::SecondVote {
-                    election.second_round_id.clear();
+        if election.phase().eq(src_phase) {
+            match &step_type[..] {
+                "next" => {
+                    election.step_next();
                 }
-                Ok(())
-            }
-            _ => Err((StatusCode::BAD_REQUEST, "Invalid step type")),
-        }?;
+                "prev" => {
+                    election.step_prev();
+                }
+                "reset" => {
+                    election.reset_votes();
+                }
+                _ => Err((StatusCode::BAD_REQUEST, "Invalid step type"))?,
+            };
 
-        stream
-            .send(ElectionUpdate::PhaseChanged)
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream send error"))?;
-        Ok((StatusCode::ACCEPTED, [("HX-Refresh", "true")]).into_response())
-    } else {
-        Ok((StatusCode::BAD_REQUEST, [("HX-Refresh", "true")]).into_response())
-    }
+            stream
+                .send(ElectionUpdate::PhaseChanged)
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream send error"))?;
+
+            Ok((StatusCode::ACCEPTED, [("HX-Refresh", "true")]).into_response())
+        } else {
+            Ok((StatusCode::BAD_REQUEST, [("HX-Refresh", "true")]).into_response())
+        }
+    })
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -286,15 +219,9 @@ async fn post_election_voting(
     let election = db
         .get_mut(&id)
         .ok_or((StatusCode::NOT_FOUND, "Election not found"))?;
-    match election.phase {
-        ElectionPhase::FirstVote => {
-            election.first_round_id.insert(form.voter_name, form.vote);
-        }
-        ElectionPhase::SecondVote => {
-            election.second_round_id.insert(form.voter_name, form.vote);
-        }
-        _ => {}
-    }
+
+    election.add_vote(form.voter_name, form.vote);
+
     state
         .streams
         .lock()
@@ -359,8 +286,8 @@ async fn view_election_eval(
         .build();
 
     Ok(base_html(
-        format!("{} - Evaluation", election.elected_role).as_str(),
-        html! { (election.elected_role) br; "Evaluation" },
+        format!("{} - Evaluation", election.elected_role()).as_str(),
+        html! { (election.elected_role()) br; "Evaluation" },
         html! {
             div hx-ext="sse" sse-connect={"/election/" (id.to_string()) "/stream"} {
                 div #"eval"
@@ -375,7 +302,7 @@ async fn view_election_eval(
             dialog #"share-dialog" style="text-align: center;" {
                 article {
                     header {
-                        h2 { "Share the election of " (election.elected_role) }
+                        h2 { "Share the election of " (election.elected_role()) }
                     }
                     (maud::PreEscaped(qrcode_svg))
                     br; br;
@@ -397,51 +324,34 @@ async fn view_election_eval(
 fn eval_election(election: &ElectionProcess) -> Markup {
     let buttons = html! {
         div ."button-grid" {
-            button ."lbut" disabled[election.phase == ElectionPhase::FirstVote]
-            hx-post={"/election/" (election.id.to_string()) "/step/prev/" (election.phase.to_string())}
+            button ."lbut" disabled[election.phase() == ElectionPhase::FirstVote]
+            hx-post={"/election/" (election.id().to_string()) "/step/prev/" (election.phase().to_string())}
             hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
                 "Previous Phase"
             }
 
             button ."cbut secondary"
-            disabled[election.phase != ElectionPhase::FirstVote && election.phase != ElectionPhase::SecondVote]
-            hx-post={"/election/" (election.id.to_string()) "/step/reset/" (election.phase.to_string())}
+            disabled[election.phase() != ElectionPhase::FirstVote && election.phase() != ElectionPhase::SecondVote]
+            hx-post={"/election/" (election.id().to_string()) "/step/reset/" (election.phase().to_string())}
             hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
                 "Reset Votes"
             }
 
-            button ."rbut" disabled[election.phase == ElectionPhase::SafetyRound]
-            hx-post={"/election/" (election.id.to_string()) "/step/next/" (election.phase.to_string())}
+            button ."rbut" disabled[election.phase() == ElectionPhase::SafetyRound]
+            hx-post={"/election/" (election.id().to_string()) "/step/next/" (election.phase().to_string())}
             hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
                 "Next Phase"
             }
         }
     };
 
-    if election.phase == ElectionPhase::SafetyRound {
-        let accumulated_votes = election
-            .second_round_id
-            .iter()
-            .into_group_map_by(|(_, &v)| v)
-            .iter()
-            .map(|(k, v)| (election.nominees.get(k).unwrap(), v.len()))
-            .filter(|(_k, v)| *v > 0)
-            .sorted_by(|a, b| Ord::cmp(&a.1, &b.1).then_with(|| Ord::cmp(&a.0, &b.0).reverse()))
-            .rev()
-            .collect::<Vec<_>>();
-        let max_votes = accumulated_votes
-            .iter()
-            .map(|(_k, v)| *v)
-            .max()
-            .unwrap_or(1);
-        let all_with_max_votes = accumulated_votes
-            .iter()
-            .filter(|(_k, v)| *v == max_votes)
-            .map(|(k, _v)| k.to_string())
-            .collect::<Vec<_>>();
+    if election.phase() == process::ElectionPhase::SafetyRound {
+        let accumulated_votes = election.accumulated_votes();
+        let all_with_max_votes = accumulated_votes.all_with_max_votes();
+
         return html! {
-            h2 { (election.phase.nice_title()) }
-            p { (election.phase.nice_description()) }
+            h2 { (election.phase().nice_title()) }
+            p { (election.phase().nice_description()) }
             p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
 
             {( buttons )}
@@ -451,19 +361,19 @@ fn eval_election(election: &ElectionProcess) -> Markup {
     let tally = eval_tally(election);
 
     let eval_count = {
-        match election.phase {
-            ElectionPhase::FirstVote | ElectionPhase::FirstTally => {
-                html! { p { "Number of votes: " (election.first_round_id.len()) } }
+        match election.phase() {
+            process::ElectionPhase::FirstVote
+            | process::ElectionPhase::FirstTally
+            | process::ElectionPhase::SecondVote
+            | process::ElectionPhase::SecondTally => {
+                html! { p { "Number of votes: " (election.vote_count()) } }
             }
-            ElectionPhase::SecondVote | ElectionPhase::SecondTally => {
-                html! { p { "Number of votes: " (election.second_round_id.len()) } }
-            }
-            ElectionPhase::SafetyRound => unreachable!(),
+            process::ElectionPhase::SafetyRound => unreachable!(),
         }
     };
 
     html! {
-        h2 { (election.phase.nice_title()) }
+        h2 { (election.phase().nice_title()) }
 
         {( eval_count )}
 
@@ -474,41 +384,22 @@ fn eval_election(election: &ElectionProcess) -> Markup {
 }
 
 fn eval_tally(election: &ElectionProcess) -> Markup {
-    let round = match election.phase {
-        ElectionPhase::FirstVote => &election.first_round_id,
-        ElectionPhase::FirstTally => &election.first_round_id,
-        ElectionPhase::SecondVote => &election.second_round_id,
-        ElectionPhase::SecondTally => &election.second_round_id,
-        ElectionPhase::SafetyRound => &election.second_round_id,
-    };
-
-    if !(election.phase == ElectionPhase::FirstTally
-        || election.phase == ElectionPhase::SecondTally)
+    if !(election.phase() == process::ElectionPhase::FirstTally
+        || election.phase() == process::ElectionPhase::SecondTally)
     {
         return html! {
             p { "The following users have voted:" }
             ul #"voter-list" {
-                @for voter_name in round.keys().sorted() {
+                @for voter_name in election.voters() {
                     li { (voter_name) }
                 }
             }
         };
     }
 
-    let accumulated_votes = round
-        .iter()
-        .into_group_map_by(|(_, &v)| v)
-        .iter()
-        .map(|(k, v)| (election.nominees.get(k).unwrap(), v.len()))
-        .filter(|(_k, v)| *v > 0)
-        .sorted_by(|a, b| Ord::cmp(&a.1, &b.1).then_with(|| Ord::cmp(&a.0, &b.0).reverse()))
-        .rev()
-        .collect::<Vec<_>>();
-    let max_votes = accumulated_votes
-        .iter()
-        .map(|(_k, v)| *v)
-        .max()
-        .unwrap_or(1);
+    let round = election.current_round();
+    let accumulated_votes = election.accumulated_votes();
+    let max_votes = accumulated_votes.max_votes();
 
     html! {
         br;
@@ -525,7 +416,7 @@ fn eval_tally(election: &ElectionProcess) -> Markup {
                     @for (voter_name, vote) in round.iter().sorted_by_key(|(n, _)| &n[..]) {
                         tr {
                             td { (voter_name) }
-                            td { (election.nominees.get(vote).unwrap()) }
+                            td { (election.get_vote(*vote)) }
                         }
                     }
                 }
@@ -543,7 +434,7 @@ fn eval_tally(election: &ElectionProcess) -> Markup {
                     }
                 }
                 tbody {
-                    @for (votee, vote_count) in accumulated_votes {
+                    @for (votee, vote_count) in accumulated_votes.results {
                         tr {
                             th scope="row" {(votee)}
                             td style={"--size: " (vote_count as f32 / (max_votes as f32))}{
@@ -569,8 +460,8 @@ async fn view_election_voting(
     let election = db.get(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(base_html(
-        election.elected_role.as_str(),
-        html! {(election.elected_role.as_str())},
+        election.elected_role(),
+        html! {(election.elected_role())},
         html! {
             div hx-ext="sse" sse-connect={"/election/" (id.to_string()) "/stream"} {
               div #"vote-content"
@@ -598,12 +489,12 @@ async fn get_election_voting_form(
 }
 
 fn voting_form(election: &ElectionProcess) -> Markup {
-    match election.phase {
-        ElectionPhase::FirstVote | ElectionPhase::SecondVote => {
-            let sorted_nominees = election.nominees.iter().sorted_by_key(|(k, _)| *k);
+    match election.phase() {
+        process::ElectionPhase::FirstVote | process::ElectionPhase::SecondVote => {
+            let sorted_nominees = election.get_sorted_nominees();
             html! {
-                h2 { (election.phase.nice_title()) }
-                p { (election.phase.nice_description()) }
+                h2 { (election.phase().nice_title()) }
+                p { (election.phase().nice_description()) }
                 form #"vote" ."table rows" {
                     label for="elected_role" {
                         "Voter Name: ";
@@ -613,12 +504,12 @@ fn voting_form(election: &ElectionProcess) -> Markup {
                         "Vote :";
                         select name="vote" required {
                             @for (id, nominee) in sorted_nominees {
-                                option value=(id.to_string()) { (nominee) }
+                                option value=(id) { (nominee) }
                             }
                         }
                     }
                     button
-                      hx-post={"/election/" (election.id.to_string()) "/voting"}
+                      hx-post={"/election/" (election.id()) "/voting"}
                       hx-trigger="click" hx-target="#vote" hx-swap="outerHTML"
                       style="left: 50%; position: relative; translate: -50%;" {
                         "Vote!"
@@ -626,37 +517,19 @@ fn voting_form(election: &ElectionProcess) -> Markup {
                 }
             }
         }
-        ElectionPhase::FirstTally | ElectionPhase::SecondTally => {
+        process::ElectionPhase::FirstTally | process::ElectionPhase::SecondTally => {
             html! {
-                h2 { (election.phase.nice_title()) }
-                p { (election.phase.nice_description()) }
+                h2 { (election.phase().nice_title()) }
+                p { (election.phase().nice_description()) }
                 {( eval_tally(election) )}
             }
         }
-        ElectionPhase::SafetyRound => {
-            let accumulated_votes = election
-                .second_round_id
-                .iter()
-                .into_group_map_by(|(_, &v)| v)
-                .iter()
-                .map(|(k, v)| (election.nominees.get(k).unwrap(), v.len()))
-                .filter(|(_k, v)| *v > 0)
-                .sorted_by(|a, b| Ord::cmp(&a.1, &b.1).then_with(|| Ord::cmp(&a.0, &b.0).reverse()))
-                .rev()
-                .collect::<Vec<_>>();
-            let max_votes = accumulated_votes
-                .iter()
-                .map(|(_k, v)| *v)
-                .max()
-                .unwrap_or(1);
-            let all_with_max_votes = accumulated_votes
-                .iter()
-                .filter(|(_k, v)| *v == max_votes)
-                .map(|(k, _v)| k.to_string())
-                .collect::<Vec<_>>();
+        process::ElectionPhase::SafetyRound => {
+            let accumulated_votes = election.accumulated_votes();
+            let all_with_max_votes = accumulated_votes.all_with_max_votes();
             html!(
-                h2 { (election.phase.nice_title()) }
-                p { (election.phase.nice_description()) }
+                h2 { (election.phase().nice_title()) }
+                p { (election.phase().nice_description()) }
                 p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
             )
         }
@@ -718,13 +591,15 @@ fn base_html(title: &str, title_markup: Markup, content: Markup, fragment: Marku
             head {
                 meta charset="UTF-8" {}
                 meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" {}
-                script src="https://unpkg.com/htmx.org" {}
-                script src="https://unpkg.com/htmx.org/dist/ext/sse.js" {}
+                script src="/htmx.1.9.12.js" {}
+                script src="/htmx-ext-sse.1.9.12.js" {}
+                //script src="https://unpkg.com/htmx.org" {}
+                //script src="https://unpkg.com/htmx.org/dist/ext/sse.js" {}
                 //link rel="stylesheet" href="https://unpkg.com/missing.css@1.1.1" {}
                 link
                   rel="stylesheet"
-                  href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" {}
-                link rel="stylesheet" href="https://unpkg.com/charts.css/dist/charts.min.css" {}
+                  href="/pico.min.css" {}
+                link rel="stylesheet" href="/charts.min.css" {}
                 link rel="stylesheet" href="/styles.css" {}
                 title { "IEP - " (title) }
             }
