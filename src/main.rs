@@ -24,8 +24,6 @@ use tower::Layer;
 use tower_http::{normalize_path::NormalizePathLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::process::ElectionPhase;
-
 mod process;
 
 #[tokio::main]
@@ -144,6 +142,13 @@ impl ElectionDB {
                 f(election, stream)
             })
     }
+
+    fn read_election(&self, id: &str) -> Result<ElectionProcess, StatusError> {
+        let db = self.db.lock().map_err(|_| DB_UNLOCK_ERR)?;
+        db.get(id)
+            .cloned()
+            .ok_or((StatusCode::NOT_FOUND, "Election not found"))
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -212,24 +217,13 @@ async fn post_election_voting(
     Path(id): Path<String>,
     Form(form): Form<Vote>,
 ) -> Result<Markup, (StatusCode, &'static str)> {
-    let mut db = state
-        .db
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "DB Lock error"))?;
-    let election = db
-        .get_mut(&id)
-        .ok_or((StatusCode::NOT_FOUND, "Election not found"))?;
-
-    election.add_vote(form.voter_name, form.vote);
-
-    state
-        .streams
-        .lock()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream Lock error"))?
-        .get(&id)
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Stream not found"))?
-        .send(ElectionUpdate::VotesChanged)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream send error"))?;
+    state.modify_election(&id, |election, stream| {
+        election.add_vote(form.voter_name, form.vote);
+        stream
+            .send(ElectionUpdate::VotesChanged)
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream send error"))?;
+        Ok(())
+    })?;
 
     Ok(html! {
         p { "Vote added!" }
@@ -237,8 +231,7 @@ async fn post_election_voting(
 }
 
 async fn get_election_join(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
-    let id = params.get("election_id");
-    match id {
+    match params.get("election_id") {
         Some(id) => (
             StatusCode::OK,
             [(
@@ -256,14 +249,8 @@ async fn get_election_join(Query(params): Query<HashMap<String, String>>) -> imp
 async fn get_election_eval_content(
     Path(id): Path<String>,
     State(state): State<ElectionDB>,
-) -> Result<Markup, StatusCode> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let election = db.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok(eval_election(election))
+) -> Result<Markup, StatusError> {
+    Ok(render::eval_screen(&state.read_election(&id)?))
 }
 
 async fn view_election_eval(
@@ -294,7 +281,7 @@ async fn view_election_eval(
                   hx-get={"/election/" (id.to_string()) "/eval/content"}
                   hx-trigger="sse:phase-changed,sse:votes-changed"
                   hx-swap="innerHTML" {
-                    {(eval_election(election))}
+                    {( render::eval_screen(election) )}
                 }
             }
         },
@@ -321,131 +308,179 @@ async fn view_election_eval(
     ))
 }
 
-fn eval_election(election: &ElectionProcess) -> Markup {
-    let buttons = html! {
-        div ."button-grid" {
-            button ."lbut" disabled[election.phase() == ElectionPhase::FirstVote]
-            hx-post={"/election/" (election.id().to_string()) "/step/prev/" (election.phase().to_string())}
-            hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
-                "Previous Phase"
-            }
+mod render {
+    use itertools::Itertools;
+    use maud::html;
 
-            button ."cbut secondary"
-            disabled[election.phase() != ElectionPhase::FirstVote && election.phase() != ElectionPhase::SecondVote]
-            hx-post={"/election/" (election.id().to_string()) "/step/reset/" (election.phase().to_string())}
-            hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
-                "Reset Votes"
-            }
+    use crate::process::{self, *};
 
-            button ."rbut" disabled[election.phase() == ElectionPhase::SafetyRound]
-            hx-post={"/election/" (election.id().to_string()) "/step/next/" (election.phase().to_string())}
-            hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
-                "Next Phase"
-            }
-        }
-    };
-
-    if election.phase() == process::ElectionPhase::SafetyRound {
-        let accumulated_votes = election.accumulated_votes();
-        let all_with_max_votes = accumulated_votes.all_with_max_votes();
-
-        return html! {
+    pub(crate) fn eval_screen(election: &ElectionProcess) -> maud::Markup {
+        html! {
             h2 { (election.phase().nice_title()) }
-            p { (election.phase().nice_description()) }
-            p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
 
-            {( buttons )}
-        };
-    }
-
-    let tally = eval_tally(election);
-
-    let eval_count = {
-        match election.phase() {
-            process::ElectionPhase::FirstVote
-            | process::ElectionPhase::FirstTally
-            | process::ElectionPhase::SecondVote
-            | process::ElectionPhase::SecondTally => {
-                html! { p { "Number of votes: " (election.vote_count()) } }
+            @match election.phase() {
+                process::ElectionPhase::FirstVote
+                | process::ElectionPhase::SecondVote => {
+                    p { "Number of votes: " (election.vote_count()) }
+                    {( voters_list(election) )}
+                }
+                process::ElectionPhase::FirstTally
+                | process::ElectionPhase::SecondTally => {
+                    p { "Number of votes: " (election.vote_count()) }
+                    {( eval_tally(election))}
+                }
+                process::ElectionPhase::SafetyRound => {
+                    p { "The most votes were for: " (
+                            election.accumulated_votes()
+                                .results.iter().take(3)
+                                .map(|v| format!("{} ({})", v.0, v.1))
+                                .join(", ")
+                        )
+                    }
+                }
             }
-            process::ElectionPhase::SafetyRound => unreachable!(),
+
+            {( switch_phase_buttons(election) )}
         }
-    };
-
-    html! {
-        h2 { (election.phase().nice_title()) }
-
-        {( eval_count )}
-
-        {( tally )}
-
-        {( buttons )}
     }
-}
 
-fn eval_tally(election: &ElectionProcess) -> Markup {
-    if !(election.phase() == process::ElectionPhase::FirstTally
-        || election.phase() == process::ElectionPhase::SecondTally)
-    {
-        return html! {
+    pub(crate) fn switch_phase_buttons(election: &ElectionProcess) -> maud::Markup {
+        html! {
+            div ."button-grid" {
+                button ."lbut" disabled[election.phase() == ElectionPhase::FirstVote]
+                hx-post={"/election/" (election.id().to_string()) "/step/prev/" (election.phase().to_string())}
+                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                    "Previous Phase"
+                }
+
+                button ."cbut secondary"
+                disabled[election.phase() != ElectionPhase::FirstVote && election.phase() != ElectionPhase::SecondVote]
+                hx-post={"/election/" (election.id().to_string()) "/step/reset/" (election.phase().to_string())}
+                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                    "Reset Votes"
+                }
+
+                button ."rbut" disabled[election.phase() == ElectionPhase::SafetyRound]
+                hx-post={"/election/" (election.id().to_string()) "/step/next/" (election.phase().to_string())}
+                hx-trigger="click" hx-swap="none" hx-confirm="Are you sure?" {
+                    "Next Phase"
+                }
+            }
+        }
+    }
+
+    pub(crate) fn voters_list(election: &ElectionProcess) -> maud::Markup {
+        html! {
             p { "The following users have voted:" }
             ul #"voter-list" {
                 @for voter_name in election.voters() {
                     li { (voter_name) }
                 }
             }
-        };
+        }
     }
 
-    let round = election.current_round();
-    let accumulated_votes = election.accumulated_votes();
-    let max_votes = accumulated_votes.max_votes();
+    pub(crate) fn eval_tally(election: &ElectionProcess) -> maud::Markup {
+        if !(election.phase() == process::ElectionPhase::FirstTally
+            || election.phase() == process::ElectionPhase::SecondTally)
+        {
+            return voters_list(election);
+        }
 
-    html! {
-        br;
-        details open {
-            summary { "Individual Votes" }
-            table ."striped" {
-                thead {
-                    tr {
-                        th { "Voter" }
-                        th { "Vote" }
-                    }
-                }
-                tbody {
-                    @for (voter_name, vote) in round.iter().sorted_by_key(|(n, _)| &n[..]) {
+        let round = election.current_round();
+        let accumulated_votes = election.accumulated_votes();
+        let max_votes = accumulated_votes.max_votes();
+
+        html! {
+            br;
+            details open {
+                summary { "Individual Votes" }
+                table ."striped" {
+                    thead {
                         tr {
-                            td { (voter_name) }
-                            td { (election.get_vote(*vote)) }
+                            th { "Voter" }
+                            th { "Vote" }
                         }
                     }
-                }
-            }
-        }
-        br;
-        div #"eval-chart" {
-            table
-                ."charts-css bar show-labels data-spacing-1 data-start show-data-on-hover"
-                style="--labels-size: 10em;" {
-                thead {
-                    tr {
-                        th { "Nominee" }
-                        th { "Votes" }
-                    }
-                }
-                tbody {
-                    @for (votee, vote_count) in accumulated_votes.results {
-                        tr {
-                            th scope="row" {(votee)}
-                            td style={"--size: " (vote_count as f32 / (max_votes as f32))}{
-                                span ."data" {(vote_count)}
+                    tbody {
+                        @for (voter_name, vote) in round.iter().sorted_by_key(|(n, _)| &n[..]) {
+                            tr {
+                                td { (voter_name) }
+                                td { (election.get_vote(*vote)) }
                             }
                         }
                     }
                 }
             }
+            br;
+            div #"eval-chart" {
+                table
+                    ."charts-css bar show-labels data-spacing-1 data-start show-data-on-hover"
+                    style="--labels-size: 10em;" {
+                    thead {
+                        tr {
+                            th { "Nominee" }
+                            th { "Votes" }
+                        }
+                    }
+                    tbody {
+                        @for (votee, vote_count) in accumulated_votes.results {
+                            tr {
+                                th scope="row" {(votee)}
+                                td style={"--size: " (vote_count as f32 / (max_votes as f32))}{
+                                    span ."data" {(vote_count)}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            br;
         }
-        br;
+    }
+
+    pub(crate) fn voting_form(election: &ElectionProcess) -> maud::Markup {
+        html!(
+            h2 { (election.phase().nice_title()) }
+            p { (election.phase().nice_description()) }
+
+            @match election.phase() {
+                process::ElectionPhase::FirstVote | process::ElectionPhase::SecondVote => {
+                    form #"vote" ."table rows" {
+                        label for="elected_role" {
+                            "Your Name: ";
+                            input type="text" name="voter_name" required {}
+                        }
+                        label for="vote" {
+                            "Vote :";
+                            select name="vote" required {
+                                @for (id, nominee) in election.get_sorted_nominees() {
+                                    option value=(id) { (nominee) }
+                                }
+                            }
+                        }
+                        button
+                            hx-post={"/election/" (election.id()) "/voting"}
+                            hx-trigger="click" hx-target="#vote" hx-swap="outerHTML"
+                            style="left: 50%; position: relative; translate: -50%;" {
+                            "Vote!"
+                        }
+                    }
+                }
+                process::ElectionPhase::FirstTally | process::ElectionPhase::SecondTally => {
+                    {( eval_tally(election) )}
+                }
+                process::ElectionPhase::SafetyRound => {
+                    p { "The most votes were for: " (
+                            election.accumulated_votes()
+                                .results.iter().take(3)
+                                .map(|v| format!("{} ({})", v.0, v.1))
+                                .join(", ")
+                        )
+                    }
+                }
+            }
+        )
     }
 }
 
@@ -468,7 +503,7 @@ async fn view_election_voting(
                 hx-get={"/election/" (id.to_string()) "/voting/form"}
                 hx-trigger="sse:phase-changed"
                 hx-swap="innerHTML" {
-                  ({ voting_form(election) })
+                  ({ render::voting_form(election) })
               }
             }
         },
@@ -479,61 +514,8 @@ async fn view_election_voting(
 async fn get_election_voting_form(
     Path(id): Path<String>,
     State(state): State<ElectionDB>,
-) -> Result<Markup, StatusCode> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let election = db.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(voting_form(election))
-}
-
-fn voting_form(election: &ElectionProcess) -> Markup {
-    match election.phase() {
-        process::ElectionPhase::FirstVote | process::ElectionPhase::SecondVote => {
-            let sorted_nominees = election.get_sorted_nominees();
-            html! {
-                h2 { (election.phase().nice_title()) }
-                p { (election.phase().nice_description()) }
-                form #"vote" ."table rows" {
-                    label for="elected_role" {
-                        "Voter Name: ";
-                        input type="text" name="voter_name" required {}
-                    }
-                    label for="vote" {
-                        "Vote :";
-                        select name="vote" required {
-                            @for (id, nominee) in sorted_nominees {
-                                option value=(id) { (nominee) }
-                            }
-                        }
-                    }
-                    button
-                      hx-post={"/election/" (election.id()) "/voting"}
-                      hx-trigger="click" hx-target="#vote" hx-swap="outerHTML"
-                      style="left: 50%; position: relative; translate: -50%;" {
-                        "Vote!"
-                    }
-                }
-            }
-        }
-        process::ElectionPhase::FirstTally | process::ElectionPhase::SecondTally => {
-            html! {
-                h2 { (election.phase().nice_title()) }
-                p { (election.phase().nice_description()) }
-                {( eval_tally(election) )}
-            }
-        }
-        process::ElectionPhase::SafetyRound => {
-            let accumulated_votes = election.accumulated_votes();
-            let all_with_max_votes = accumulated_votes.all_with_max_votes();
-            html!(
-                h2 { (election.phase().nice_title()) }
-                p { (election.phase().nice_description()) }
-                p { "The most votes were for: " ( all_with_max_votes.join(", ") ) }
-            )
-        }
-    }
+) -> Result<Markup, StatusError> {
+    Ok(render::voting_form(&state.read_election(&id)?))
 }
 
 async fn view_home() -> Markup {
@@ -584,7 +566,12 @@ async fn view_home() -> Markup {
     )
 }
 
-fn base_html(title: &str, title_markup: Markup, content: Markup, fragment: Markup) -> Markup {
+fn base_html(
+    title: &str,
+    title_markup: Markup,
+    content: Markup,
+    navbar_fragment: Markup,
+) -> Markup {
     html! {
         (DOCTYPE)
         html {
@@ -607,8 +594,8 @@ fn base_html(title: &str, title_markup: Markup, content: Markup, fragment: Marku
                 header ."container" {
                     nav {
                         ul { li { a href="/" ."secondary" style="font-size: 1.5em;" {"🏠"} } }
-                        ul { li style="font-size: 1.5em; text-align: center;"{ strong {(title_markup)} }}
-                        ul { li {(fragment)} }
+                        ul { li style="font-size: 1.5em; text-align: center;" { strong {(title_markup)} }}
+                        ul { li {(navbar_fragment)} }
                     }
                 }
                 main ."container" {
